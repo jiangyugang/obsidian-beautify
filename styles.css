@@ -645,7 +645,8 @@
 .bn-add-child:hover { color: var(--text-normal); background: var(--background-modifier-hover); }
 .bn-add-child svg { width: 14px; height: 14px; }
 .nav-folder-title:hover .bn-add-child, .nav-file-title:hover .bn-add-child { display: flex; }
-body.is-mobile .bn-add-child { display: none !important; }
+/* mobile: never show the hover +; specificity above the hover rules below */
+body.is-mobile .nav-folder-title:hover .bn-add-child, body.is-mobile .nav-file-title:hover .bn-add-child { display: none; }
 
 /* host: item icons (simplified Iconic) */
 .nav-folder-title .bn-item-icon, .nav-file-title .bn-item-icon { margin-right: 5px; flex-shrink: 0; }
@@ -742,13 +743,13 @@ li.task-list-item:hover .bn-task-line-icon.is-empty { opacity: 0.5; }
 .bn-tv-card { border: 1px solid var(--background-modifier-border); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; background: var(--background-primary); cursor: pointer; transition: border-color 0.15s ease, opacity 0.2s ease; }
 .bn-tv-card:hover { border-color: var(--interactive-accent); }
 .bn-tv-card.is-done { opacity: 0.55; }
-.bn-tv-card.is-done .bn-tv-card-label { color: var(--text-muted); text-decoration: line-through; text-decoration-color: var(--text-faint); }
+.bn-tv-card.is-done .bn-tv-card-label { color: var(--text-muted); text-decoration: line-through; }
 .bn-tv-card.is-dragging { opacity: 0.4; }
 .bn-tv-card-head { display: flex; align-items: flex-start; gap: 7px; }
 .bn-tv-card-head .bn-task-check { margin-top: 2px; }
 .bn-tv-card-icon { font-size: 16px; line-height: 1.4; }
 .bn-tv-card-label { flex: 1 1 auto; min-width: 0; font-size: var(--font-small); line-height: 1.5; overflow-wrap: anywhere; }
-.bn-tv-card-label .internal-link { color: var(--link-color); text-decoration-color: transparent; }
+.bn-tv-card-label .internal-link { color: var(--link-color); text-decoration: none; }
 .bn-tv-card-label .internal-link:hover { text-decoration: underline; }
 .bn-tv-card-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin-top: 6px; }
 .bn-tv-empty { padding: 10px 4px; color: var(--text-faint); font-size: var(--font-smaller); text-align: center; }
@@ -802,7 +803,9 @@ input.task-list-item-checkbox {
 	border-radius: 3px !important;
 }
 /* harden the plugin-painted checkbox in the tasks view against the same
-   theme roundness */
+   theme roundness. !important is deliberate here: theme checkbox rules come
+   with unpredictable specificity (Minimal paints them round), and a plain
+   selector race against arbitrary themes cannot be won. */
 .bn-task-check { border-radius: 3px !important; }
 .bn-task-check:checked { border-radius: 3px !important; }
 

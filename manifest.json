@@ -1,7 +1,7 @@
 {
   "id": "beautify",
   "name": "Beautify",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "minAppVersion": "1.13.7",
   "description": "Make the file explorer work like Notion: folders as pages, manual ordering, colorful icons, hide rules, per-note view modes, and inline task management with dashboard, kanban and quadrant views.",
   "author": "jiangyg (based on elfmedy & vcarus)",
