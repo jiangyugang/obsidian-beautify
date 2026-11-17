@@ -1,0 +1,9 @@
+{
+  "id": "beautify",
+  "name": "Beautify",
+  "version": "2.11.1",
+  "minAppVersion": "1.13.7",
+  "description": "让 Obsidian 的文件列表像 Notion 一样工作:目录即页面、手动排序、彩色图标、隐藏规则、按笔记属性自动切换阅读/编辑视图、任务管理(行内日期与优先级、工作台·看板·四象限视图)。原生实现,行为对齐 Branch Note(elfmedy)与 Explorer Order Editor(vcarus)并参考 obsidian-tasks 任务模型,均 MIT。",
+  "author": "jiangyg (based on elfmedy & vcarus)",
+  "isDesktopOnly": false
+}
