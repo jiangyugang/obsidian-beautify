@@ -1,6 +1,20 @@
 # Beautify
 
-**English** — Make Obsidian's file explorer work like Notion: folders open as pages, drag-and-drop manual ordering, colorful icons, hide rules, per-note view modes, and a full inline task system (Dashboard / Kanban / Eisenhower matrix). Free and open source under the MIT license. 中文文档见下。
+Make Obsidian's file explorer work like Notion: folders as pages, drag-and-drop manual ordering, colorful icons, hide rules, per-note view modes, and a full inline task system (Dashboard / Kanban / Eisenhower matrix). Free and open source under the MIT license. Formerly known as Branch & Order; existing data migrates automatically.
+
+## Installation
+
+- **Manual**: download `main.js`, `manifest.json` and `styles.css` from the [latest release](https://github.com/jiangyugang/obsidian-beautify/releases/latest) into `<vault>/.obsidian/plugins/beautify/`, restart Obsidian, and enable **Beautify** under Settings → Community plugins.
+- **BRAT**: install [BRAT](https://github.com/TfTHacker/obsidian42-brat), then add the repository `jiangyugang/obsidian-beautify` as a beta plugin.
+
+## Usage
+
+- **Pages**: click a folder to open its index note (`Folder/Folder.md`); hover the ＋ button next to any name to create sub-notes; drag items to reorder.
+- **Tasks**: type `[]` followed by a space in the editor to create a task instantly; run the command **Open task view** for the Dashboard / Kanban / Quadrant views.
+- **Icons & hide rules**: right-click any file or folder to set an icon or hide it; use the eye button at the top of the file explorer to reveal hidden items.
+- **View modes**: toggle reading/editing with the button in the editor's top-right corner (or Ctrl/Cmd+E) — Beautify remembers the choice per note.
+
+完整中文文档见下。
 
 让 Obsidian 的文件列表像 Notion 一样工作:目录即页面、手动排序、彩色图标、隐藏规则、按笔记属性自动切换视图,并内置一套行内任务管理(工作台 / 看板 / 四象限)。前身是 Branch & Order(合并 Branch Note 与 Explorer Order Editor),旧数据自动升级迁移。
 

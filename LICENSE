@@ -19,17 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
---------------------------------------------------------------------------
-
-Third-party acknowledgments
-
-Beautify is an independent, native reimplementation — no third-party code is
-included in this repository. Its sorting and page features are behavior-
-compatible with, and were informed by, the following MIT-licensed projects:
-
-  - Branch Note — https://github.com/elfmedy/branch-note (MIT, (c) elfmedy)
-  - Explorer Order Editor — https://github.com/vcarus/obsidian-explorer-order-editor (MIT, (c) vcarus)
-
-The task model draws on the design of obsidian-tasks (MIT):
-https://github.com/obsidian-tasks-group/obsidian-tasks
