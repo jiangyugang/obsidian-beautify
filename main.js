@@ -87,27 +87,6 @@ const LEGACY_CONFIG_NOTES = ["Notionify.md"];
 // Plugin ids whose data.json is imported once on first run.
 const LEGACY_PLUGIN_IDS = ["branch-note", "explorer-order-editor", "branch-order", "iconic", "hide-folders"];
 
-// [diag] runtime forensics for the v2.10.x boot/unload anomalies.
-// TEMPORARILY OFF (2.10.12) — flip __BDIAG_ON to true to re-enable; the
-// call sites stay so nothing else changes. "/tmp/…" does not exist for the
-// Obsidian process on Windows (writes threw and were swallowed — the log
-// never landed); TEMP first, /tmp fallback.
-const __BDIAG_ON = false;
-let __bdiagPath = null;
-function __bdiag(msg) {
-  if (!__BDIAG_ON) return;
-  try {
-    const fs = require("fs");
-    const path = require("path");
-    if (__bdiagPath === null) {
-      const base =
-        (typeof process !== "undefined" && process.env && process.env.TEMP) || "/tmp";
-      __bdiagPath = path.join(base, "beautify-diag.log");
-    }
-    fs.appendFileSync(__bdiagPath, new Date().toISOString() + " " + msg + "\n");
-  } catch (e) {}
-}
-
 // Serialize one debounced disk flush of the config note onto its write queue.
 // Shared by writeSlot's timer and flush(); dirty stays set on failure so the
 // next flush retries.
@@ -426,6 +405,9 @@ class OrderStore {
         // icons are read LIVE from the host settings — the tree is their only
         // serialized home now
         index: bnTreeFromMaps(this.index, this.plugin.settings && this.plugin.settings.icons),
+        // v1.0.4: recovery artifact (pre-tree flat JSON / v1.x order-note
+        // text); undefined drops out of the serialization on clean installs
+        indexBackup: this.pendingIndexBackup,
       });
     } finally {
       if (this.plugin.__traceMark) this.plugin.__traceMark("order.persist(writeSlot)", Date.now() - __t);
@@ -454,6 +436,9 @@ class OrderStore {
     this.settings.showMoveActions = slot.showMoveActions === true;
     let index = null;
     let migrated = false;
+    // v1.0.4: recovery artifact — whatever shape the migration replaces is
+    // kept in the note itself (see pendingIndexBackup / #persist)
+    let backup;
     // v3 = the nameless root node {order?, children}; v2 = flat {path: [names]}.
     // Discrimination: v3 carries children as an array of single-key node
     // objects / an `order: true` flag; a v2 folder literally named "children"
@@ -482,13 +467,15 @@ class OrderStore {
       this.plugin.__iconsJson = JSON.stringify(parsed.icons);
     }
     if (!index && idxVal && typeof idxVal === "object" && !Array.isArray(idxVal)) {
-      index = indexFromPlain(idxVal); // v2 flat map → rewrite as a tree
+      backup = JSON.stringify(idxVal); // stash the flat shape — v2 flat map → rewrite as a tree
+      index = indexFromPlain(idxVal);
       migrated = true;
     }
     if (!index && typeof slot.indexBackup === "string" && slot.indexBackup !== "") {
       // v1.x kept the whole order-note TEXT in indexBackup.
       const parsed = parseJsonBlock(slot.indexBackup);
       if (parsed && typeof parsed === "object") index = indexFromPlain(parsed);
+      backup = slot.indexBackup; // the original text IS the artifact — keep it
       migrated = true;
     }
     if (!index) {
@@ -498,6 +485,16 @@ class OrderStore {
     }
     this.index = index || new Map();
     this.usable = true;
+    // v1.0.4: carry the recovery artifact forward — a migration stashes the
+    // shape it replaced, a steady-state load keeps whatever the note already
+    // holds; #persist writes it back so writeSlot's whole-slot replacement
+    // never silently drops it
+    this.pendingIndexBackup =
+      backup !== undefined
+        ? backup
+        : typeof slot.indexBackup === "string" && slot.indexBackup !== ""
+          ? slot.indexBackup
+          : undefined;
     // v2 → v3 rewrite pending: the host learns via this flag (its save then
     // strips the now-redundant flat icons so the note converts fully once).
     this.migratedToTree = migrated;
@@ -769,7 +766,6 @@ class OrderCore {
   }
   async activate() {
     await this.store.load();
-    __bdiag("OrderCore.activate: store keys=" + this.store.keys().size + " usable=" + this.store.usable); // [diag]
     this.#patchSortWithRetry();
     this.#registerIndexSync();
     this.#registerDragSync();
@@ -789,7 +785,6 @@ class OrderCore {
       if (this.sortPatched) return true;
       const view = explorerViews(this.plugin.app)[0];
       if (!view) {
-        __bdiag("tryPatch: no explorer view yet"); // [diag]
         return false;
       }
       const proto = Object.getPrototypeOf(view);
@@ -804,7 +799,6 @@ class OrderCore {
           );
           p = Object.getPrototypeOf(p);
         }
-        __bdiag("tryPatch: chain=" + chain.join(" < "));
       } catch (e) {}
       if (!Object.hasOwn(proto, "getSortedFolderItems")) return true;
       const previous = proto.getSortedFolderItems;
@@ -4338,7 +4332,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     setTimeout(() => {
       if (!this.alive) return;
       if (this.delegatedViews.size === 0) {
-        __bdiag("bootRetryMount: attempt " + attempt + " — explorer not mounted yet"); // [diag]
         try {
           this.syncViews();
         } catch (e) {
@@ -4357,10 +4350,8 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       if (!this.alive || !this.order) return;
       try {
         if (this.order.store.keys().size > 0) return; // healthy, nothing to do
-        __bdiag("bootRetryOrderStore: attempt " + attempt + " — store empty, re-reading"); // [diag]
         void this.order.store.load().then(() => {
           if (this.order && this.order.store.keys().size > 0) {
-            __bdiag("bootRetryOrderStore: recovered " + this.order.store.keys().size + " key(s)"); // [diag]
             this.refresh();
           } else this.__bootRetryOrderStore(attempt + 1);
         });
@@ -5041,7 +5032,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
           const stale = view.getSortedFolderItems;
           if (typeof stale === "function" && stale.name === "filtered") {
             delete view.getSortedFolderItems;
-            __bdiag("syncViews: removed a stale instance wrapper from an explorer view"); // [diag]
             if (typeof view.requestSort === "function") view.requestSort();
           }
         }
@@ -7182,19 +7172,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
   // Branch Note instance wrappers mounted, does the saved order actually
   // render? One Notice summarises it.
   __diagnose() {
-    try {
-      // [diag]
-      __bdiag(
-        "diagnose: order=" +
-          (this.order ? "yes" : "null") +
-          " storeKeys=" +
-          (this.order ? this.order.store.keys().size : "-") +
-          " patched=" +
-          (this.order ? this.order.sortPatched : "-") +
-          " delegated=" +
-          this.delegatedViews.size
-      );
-    } catch (e) {}
     const problems = [];
     const views = explorerViews(this.app);
     let wrapped = 0;
@@ -7330,14 +7307,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     await this.config.load();
     try {
       // [diag]
-      const d = this.config.data || {};
-      const oe = d.orderEditor || {};
-      __bdiag(
-        "onload: config slots=" +
-          JSON.stringify(Object.keys(d)) +
-          " orderEditor.index keys=" +
-          (oe.index && typeof oe.index === "object" ? Object.keys(oe.index).length : String(oe.index))
-      );
     } catch (e) {}
     await this.loadHostSettings();
     await this.loadBranchData();
@@ -7547,7 +7516,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
           // firing after the plugin was turned off reported ⚠️ from a dead
           // instance (order=null) — which read exactly like a failed boot.
           if (!_this.alive) {
-            __bdiag("diagnose skipped — plugin already unloaded"); // [diag]
             return;
           }
           _this.__diagnose();
@@ -7594,7 +7562,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
             }
           });
         swept += this.__sweepCachedRows(view);
-        if (swept) __bdiag("sweepInjectedDom: removed " + swept + " node(s) from one view"); // [diag]
         view.__bn_quick = null;
         view.__bnQuickSig = null;
       } catch (e) {
@@ -7622,7 +7589,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     }
   }
   async onunload() {
-    __bdiag("onunload v" + (this.manifest ? this.manifest.version : "?")); // [diag]
     // Stop every decoration path immediately, even if a later step throws
     // (teardownBranchNote also sets this, but only once it gets there).
     this.alive = false;
@@ -7691,14 +7657,13 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     // while both sweeps found ZERO nodes — something re-adds (or first-adds)
     // decorations after onunload completes. One delayed verification pass
     // (bare timer, one-shot, 250ms) removes anything that appeared late and
-    // logs it; the trail in %TEMP%\beautify-diag.log identifies the timing.
+    // logs it to the console for timing forensics.
     setTimeout(() => {
       try {
         // re-enumerate: delegatedViews is cleared by now; collapsed subtrees
         // may still hold cached rows
         for (const leaf of this.app.workspace.getLeavesOfType("file-explorer")) {
           const n = this.__sweepCachedRows(leaf.view);
-          if (n) __bdiag("POST-UNLOAD cached-row sweep removed " + n + " node(s)"); // [diag]
         }
         this.__globalSweepFallback(true);
       } catch (e) {
@@ -7754,7 +7719,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
         for (const el of containers) observer.observe(el, { childList: true, subtree: true });
         setTimeout(function () {
           stop();
-          if (total) __bdiag("POST-UNLOAD watchdog removed " + total + " node(s) within 60s"); // [diag]
         }, 60000);
       }
     } catch (e) {
@@ -7822,8 +7786,6 @@ const BeautifyPlugin = class extends obsidian.Plugin {
         /* best-effort */
       }
     }
-    if (removed) __bdiag((late ? "POST-UNLOAD " : "") + "global sweep removed " + removed + " leftover node(s)"); // [diag]
-    else if (late) __bdiag("post-unload verification: clean, 0 leftover node(s)"); // [diag]
   }
 };
 

@@ -70,7 +70,7 @@ Make Obsidian's file explorer work like Notion: folders as pages, drag-and-drop 
 
 - 来自 **Branch & Order / Beautify 旧版**:整套设置原样导入;旧排序文件(`explorer-order.md`、v1.x 的 indexBackup 备份)启动时自动转换,旧笔记移入回收站
 - 来自 **Branch Note + Explorer Order Editor**(从未用过合并版时):分别导入各自 data.json 与排序笔记
-- **1.3.0 起 `Beautify.md` 的 orderEditor 槽改为文档树格式**:`index` 由「文件夹路径 → 名称数组」的扁平表变为按目录层级嵌套的树,条目图标(原 host 槽的 `icons` 扁平表)也内联到各节点上——`{ "工作空间": { "icon": "🏢", "order": true, "children": […] } }`;`order: true` 表示该目录的 children 顺序是保存的手动排序。旧格式(含 1.3.0 之前的扁平 icons)首次启动自动转换,数据不丢
+- **1.3.0 起 `Beautify.md` 的 orderEditor 槽改为文档树格式**:`index` 由「文件夹路径 → 名称数组」的扁平表变为按目录层级嵌套的树,条目图标(原 host 槽的 `icons` 扁平表)也内联到各节点上——`{ "工作空间": { "icon": "🏢", "order": true, "children": […] } }`;`order: true` 表示该目录的 children 顺序是保存的手动排序。旧格式(含 1.3.0 之前的扁平 icons)首次启动自动转换,数据不丢;转换前的原始数据保留在槽的 `indexBackup` 字段(v1.0.4 起)作为恢复备份
 
 > 注意:命令前缀从 `branch-order:` 变为 `beautify:`,如绑定过快捷键需重新绑定。
 
