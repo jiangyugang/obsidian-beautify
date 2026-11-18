@@ -19,6 +19,16 @@ authors did not participate in this rewrite. See LICENSE for the full texts.
 
 "use strict";
 const obsidian = require("obsidian");
+// v1.1.0: hiding the task date fields in live preview / source mode needs
+// Obsidian's bundled @codemirror/view (the standard external plugins rely
+// on). Where it is unavailable (plain node test runs, exotic hosts) editor
+// hiding is skipped — reading view still hides, everything else works.
+var CM6_VIEW = null;
+try {
+  CM6_VIEW = require("@codemirror/view");
+} catch (e) {
+  CM6_VIEW = null;
+}
 
 // ---------------------------------------------------------------------------
 // §1 shared helpers
@@ -412,7 +422,10 @@ class OrderStore {
       await this.plugin.config.writeSlot("orderEditor", {
         dragToReorder: this.settings.dragToReorder,
         showMoveActions: this.settings.showMoveActions,
-        index: indexToPlain(this.index),
+        // v1.3.0: the document TREE (order + icons in one nested structure);
+        // icons are read LIVE from the host settings — the tree is their only
+        // serialized home now
+        index: bnTreeFromMaps(this.index, this.plugin.settings && this.plugin.settings.icons),
       });
     } finally {
       if (this.plugin.__traceMark) this.plugin.__traceMark("order.persist(writeSlot)", Date.now() - __t);
@@ -441,8 +454,36 @@ class OrderStore {
     this.settings.showMoveActions = slot.showMoveActions === true;
     let index = null;
     let migrated = false;
-    if (slot.index && typeof slot.index === "object" && !Array.isArray(slot.index)) {
-      index = indexFromPlain(slot.index); // steady v2 shape — nothing to rewrite
+    // v3 = the nameless root node {order?, children}; v2 = flat {path: [names]}.
+    // Discrimination: v3 carries children as an array of single-key node
+    // objects / an `order: true` flag; a v2 folder literally named "children"
+    // ({"children": ["a.md"]}) holds STRING names and must stay v2.
+    const idxVal = slot.index;
+    const isV3 =
+      idxVal &&
+      typeof idxVal === "object" &&
+      !Array.isArray(idxVal) &&
+      (Array.isArray(idxVal.children) ||
+        idxVal.order === true ||
+        Object.keys(idxVal).length === 0) &&
+      !(Array.isArray(idxVal.children) && idxVal.children.some((x) => typeof x === "string"));
+    if (isV3) {
+      // v1.3.0 steady shape: the document tree (order + icons). The tree is
+      // the ONLY serialized home of icons, so it REPLACES the in-memory map —
+      // merge semantics would un-delete icons removed on another device (an
+      // external clear-all must propagate). Legacy flat host-slot icons only
+      // exist alongside a v2 slot and are migrated into the tree on its
+      // first v3 save.
+      const parsed = bnMapsFromTree(idxVal);
+      index = parsed.index;
+      this.plugin.settings.icons = parsed.icons;
+      // re-baseline saveSettings' changed-detection — the replaced map came
+      // from the note itself, no reserialization is pending
+      this.plugin.__iconsJson = JSON.stringify(parsed.icons);
+    }
+    if (!index && idxVal && typeof idxVal === "object" && !Array.isArray(idxVal)) {
+      index = indexFromPlain(idxVal); // v2 flat map → rewrite as a tree
+      migrated = true;
     }
     if (!index && typeof slot.indexBackup === "string" && slot.indexBackup !== "") {
       // v1.x kept the whole order-note TEXT in indexBackup.
@@ -457,12 +498,21 @@ class OrderStore {
     }
     this.index = index || new Map();
     this.usable = true;
+    // v2 → v3 rewrite pending: the host learns via this flag (its save then
+    // strips the now-redundant flat icons so the note converts fully once).
+    this.migratedToTree = migrated;
     // Only a real migration (or a first-ever save) rewrites the slot; a
     // steady-state load must not touch the config note at all.
     if (migrated) {
       this.dirty = true;
       await this.#enqueueSave();
     }
+  }
+  // Icons changed through the host settings path (picker, auto-icon, rename
+  // rekey) — the tree is their only serialized home, so reserialize it.
+  touchIcons() {
+    this.dirty = true;
+    void this.#enqueueSave();
   }
   async #importLegacyNoteFile(indexPath) {
     try {
@@ -500,6 +550,135 @@ function indexToPlain(map) {
   const out = {};
   for (const [key, names] of map) out[key] = names;
   return out;
+}
+// ---- v1.3.0: orderEditor slot v3 — the document TREE format --------------------
+// The old `index` was a flat {folderPath: [names]} map — readable, but the
+// hierarchy had to be re-derived from path strings, and item ICONS lived in a
+// separate flat path→emoji map in the host slot (2000+ entries). v3 stores one
+// nested tree mirroring the vault:
+//   "index": { "order": true, "children": [
+//     { "工作空间": { "icon": "🏢", "order": true, "children": [
+//         { "待办事项": { "icon": "✅", "order": true, "children": [
+//             { "转发配置表迁移.md": { "icon": "😣" } },
+//             { "待办事项.md": {} }
+//         ]}}
+//     ]}}
+//   ]}
+// The `index` value is the nameless ROOT node; below it each item is
+// { [name]: { icon?, order?, children? } }.
+//   • children ARRAY ORDER is a saved manual order IFF the node has
+//     "order": true — pass-through folders (nodes that exist only to host a
+//     deep icon) must NOT freeze their children's sort.
+//   • The root's own saved order is the root node's order flag (the old "/"
+//     key of the flat map).
+// Runtime stays FLAT (store.index Map + settings.icons object) — the tree is
+// purely the serialization; every consumer keeps its existing model.
+
+// flat maps → tree array (deterministic: pass-through children name-sorted,
+// ordered folders list children in saved order with icon-only extras appended
+// name-sorted — exactly where mergedOrder would have put them anyway).
+function bnTreeFromMaps(indexMap, icons) {
+  const root = { name: "", icon: "", order: null, children: new Map() };
+  const nodeAt = (parent, name) => {
+    let n = parent.children.get(name);
+    if (!n) {
+      n = { name: name, icon: "", order: null, children: new Map() };
+      parent.children.set(name, n);
+    }
+    return n;
+  };
+  for (const [path, icon] of Object.entries(icons || {})) {
+    if (typeof icon !== "string" || icon === "") continue;
+    const parts = String(path).split("/");
+    if (!parts.length || parts.some((p) => !p)) continue;
+    let n = root;
+    for (const p of parts) n = nodeAt(n, p);
+    n.icon = icon;
+  }
+  for (const [key, names] of indexMap || []) {
+    if (!Array.isArray(names) || !names.length) continue;
+    const parts = key === "/" ? [] : String(key).split("/");
+    if (parts.some((p) => !p)) continue;
+    let n = root;
+    for (const p of parts) n = nodeAt(n, p);
+    n.order = names.filter((x) => typeof x === "string" && x !== "");
+    for (const nm of n.order) nodeAt(n, nm); // keep icon-less/deleted names round-tripping
+  }
+  const build = (node) => {
+    const kids = Array.from(node.children.values());
+    if (!kids.length) return [];
+    let seq = kids;
+    if (node.order) {
+      const inOrder = new Set(node.order);
+      const rest = kids.filter((k) => !inOrder.has(k.name));
+      rest.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+      seq = node.order
+        .map((nm) => node.children.get(nm))
+        .filter(Boolean)
+        .concat(rest);
+    } else {
+      kids.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    }
+    const out = [];
+    for (const k of seq) {
+      const attrs = {};
+      if (k.icon) attrs.icon = k.icon;
+      if (k.order) attrs.order = true;
+      const sub = build(k);
+      if (sub.length) attrs.children = sub;
+      const wrap = {};
+      wrap[k.name] = attrs;
+      out.push(wrap);
+    }
+    return out;
+  };
+  // The slot's `index` is the ROOT NODE object (nameless): {order?, children}
+  // — the root's own saved order needs a flag carrier just like any folder.
+  const rootAttrs = {};
+  if (root.order) rootAttrs.order = true;
+  const kids = build(root);
+  if (kids.length) rootAttrs.children = kids;
+  return rootAttrs;
+}
+// Root node object (or, tolerantly, a bare children array — a hand-simplified
+// note) → flat maps. Tolerant of hand edits: single-key nodes expected, first
+// key wins; non-object attrs ignored; empty order arrays mean "no saved
+// order" (same as the old indexFromPlain semantics).
+function bnMapsFromTree(rootNode) {
+  const index = new Map();
+  const icons = {};
+  const nameOf = (wrap) =>
+    wrap && typeof wrap === "object" && !Array.isArray(wrap) ? Object.keys(wrap)[0] : null;
+  const readOrder = (attrs, key) => {
+    if (attrs.order === true && Array.isArray(attrs.children)) {
+      const names = attrs.children
+        .map(nameOf)
+        .filter((n) => typeof n === "string" && n !== "");
+      if (names.length) index.set(key, names);
+    }
+  };
+  const walk = (arr, path) => {
+    if (!Array.isArray(arr)) return;
+    for (const wrap of arr) {
+      const name = nameOf(wrap);
+      if (typeof name !== "string" || name === "") continue;
+      const attrs = wrap[name];
+      if (!attrs || typeof attrs !== "object" || Array.isArray(attrs)) continue;
+      const childPath = path === "" ? name : path + "/" + name;
+      if (typeof attrs.icon === "string" && attrs.icon !== "") icons[childPath] = attrs.icon;
+      readOrder(attrs, childPath);
+      walk(attrs.children, childPath);
+    }
+  };
+  if (rootNode && typeof rootNode === "object" && !Array.isArray(rootNode)) {
+    // the root's own order lives on the nameless root node ("/" key)
+    readOrder(rootNode, "/");
+    walk(rootNode.children, "");
+  } else if (Array.isArray(rootNode)) {
+    // tolerated simplified shape: a bare children array (root unordered)
+    walk(rootNode, "");
+  }
+  return { index: index, icons: icons };
 }
 // ---- index maintenance (pure; each returns a NEW map or the same one) ------
 // Folder renamed: rename its key and every descendant key.
@@ -2318,6 +2497,219 @@ function serializeTaskLine(t) {
   for (const piece of tail) out += " " + piece;
   return out;
 }
+// ---- v1.1.0: date fields hidden from RENDERING by default ---------------------
+// The five bookkeeping stamps (➕ created ✅ done ❌ cancelled 🛫 start ⏳
+// scheduled) trail every task line and clutter notes, so they are hidden at
+// the DISPLAY layer only (settings toggle 任务行显示日期字段 / "Show task date
+// fields", default off):
+//   • reading view — the field text is wrapped in <span class="bn-task-dates">,
+//     hidden by CSS unless body.bn-show-task-dates is present;
+//   • live preview / source — a CodeMirror replace decoration per range; lines
+//     the cursor touches stay raw, so editing always shows the full line;
+//   • dashboard cards — the ➕/✅/❌ chips follow the same toggle.
+// 📅 due and the priority stay visible everywhere (deadlines and urgency are
+// content, not bookkeeping). The FILE text never changes and parsing,
+// serialising, toggling and promoting all keep seeing the full raw line.
+const TASK_DATE_HIDE_KEYS = [
+  "cancelledDate",
+  "doneDate",
+  "scheduledDate",
+  "startDate",
+  "createdDate",
+];
+// Ranges of the hidden fields inside `text` — the RENDERED task text without
+// the list marker (reading view) or the raw body. Same end-anchored strip
+// loop as parseTaskLine (ALL field regexes strip — fields may sit beyond a
+// due date or priority), but only the five hide-keys record spans. Spans
+// separated by spaces-only gaps merge, each group swallows the spaces to its
+// LEFT (never right — the surviving space keeps the visible parts apart),
+// and the last group also swallows trailing spaces. Returns [{from,to}]
+// ascending, offsets into `text`.
+function taskDateHideRangesInText(text) {
+  const s = String(text == null ? "" : text);
+  if (!s.trim()) return [];
+  const spans = [];
+  let rest = s;
+  let runs = 0;
+  let stripped = true;
+  while (stripped && runs++ < 20) {
+    stripped = false;
+    const trimmed = rest.replace(/[ \t]+$/, "");
+    if (trimmed.length !== rest.length) {
+      rest = trimmed;
+      stripped = true;
+    }
+    for (const key of Object.keys(TASK_FIELD_RES)) {
+      const hit = rest.match(TASK_FIELD_RES[key]);
+      if (!hit) continue;
+      const start = rest.length - hit[0].length;
+      if (TASK_DATE_HIDE_KEYS.indexOf(key) !== -1) spans.push([start, rest.length]);
+      rest = rest.slice(0, start);
+      stripped = true;
+    }
+  }
+  // fresh-task fallback: the [] shortcut stamps "➕ date " BEFORE the text
+  // (mid-line until the first rewrite) — hide that leading stamp as well
+  if (!spans.length) {
+    const lead = s.match(/^➕️? *\d{4}-\d{2}-\d{2}(?:[ \t]+|$)/);
+    if (lead) return [{ from: 0, to: lead[0].length }];
+    return [];
+  }
+  spans.sort((a, b) => a[0] - b[0]);
+  const merged = [];
+  for (const sp of spans) {
+    const prev = merged[merged.length - 1];
+    const gap = prev ? s.slice(prev[1], sp[0]) : "";
+    if (prev && /^[ \t]*$/.test(gap)) prev[1] = sp[1];
+    else merged.push([sp[0], sp[1]]);
+  }
+  const out = [];
+  for (let i = 0; i < merged.length; i++) {
+    let from = merged[i][0];
+    const floor = i > 0 ? merged[i - 1][1] : 0;
+    while (from > floor && (s[from - 1] === " " || s[from - 1] === "\t")) from--;
+    let to = merged[i][1];
+    // trailing spaces only — never the separator space before a VISIBLE
+    // field (due/priority) that follows this group
+    if (i === merged.length - 1 && /^[ \t]*$/.test(s.slice(to))) to = s.length;
+    out.push({ from, to });
+  }
+  return out;
+}
+// Absolute ranges within the RAW line (marker/indent included) — the input
+// for editor decorations. [] for non-task lines and tasks without hidden
+// fields.
+function taskDateHideRanges(rawLine) {
+  const raw = String(rawLine == null ? "" : rawLine);
+  const m = raw.match(TASK_LINE_RE);
+  if (!m) return [];
+  if (!m[4].trim()) return [];
+  // the match is ^-anchored and m[4] runs to the end, so its offset is exact
+  const bodyStart = raw.length - m[4].length;
+  return taskDateHideRangesInText(m[4]).map((r) => ({
+    from: bodyStart + r.from,
+    to: bodyStart + r.to,
+  }));
+}
+// Reading view: wrap each hidden range's text nodes in
+// <span class="bn-task-dates"> (hidden via CSS, shown by the body class the
+// toggle sets). The text STAYS in the DOM, so matchReadingTask's
+// textContent matching and the checkbox/promote wiring are unaffected.
+// Nested lists are skipped — every task li wraps itself on its own pass.
+// Vanilla DOM only (works in hover previews, embeds and popout windows).
+function bnWrapReadingTaskDates(li) {
+  try {
+    if (!li || li.__bnDatesWrapped) return;
+    li.__bnDatesWrapped = true;
+    const nodes = [];
+    const walk = (n) => {
+      for (const c of Array.prototype.slice.call(n.childNodes)) {
+        if (c.nodeType === 3) {
+          nodes.push(c);
+          continue;
+        }
+        if (c.nodeType !== 1) continue;
+        const name = c.nodeName;
+        if (name === "UL" || name === "OL") continue;
+        if (c.classList && c.classList.contains("bn-task-btn")) continue;
+        walk(c);
+      }
+    };
+    walk(li);
+    if (!nodes.length) return;
+    let text = "";
+    const offs = [];
+    for (const n of nodes) {
+      offs.push(text.length);
+      text += n.nodeValue || "";
+    }
+    const ranges = taskDateHideRangesInText(text);
+    for (let i = ranges.length - 1; i >= 0; i--) {
+      const r = ranges[i];
+      for (let j = nodes.length - 1; j >= 0; j--) {
+        const s0 = offs[j];
+        const e0 = s0 + (nodes[j].nodeValue || "").length;
+        if (e0 <= r.from || s0 >= r.to) continue;
+        const node = nodes[j];
+        const a = Math.max(r.from, s0);
+        const b = Math.min(r.to, e0);
+        const doc = li.ownerDocument || document;
+        const span = doc.createElement("span");
+        span.className = "bn-task-dates";
+        let piece = node;
+        if (a > s0) piece = node.splitText(a - s0);
+        if (b - a < (piece.nodeValue || "").length) piece.splitText(b - a);
+        node.parentNode.insertBefore(span, piece);
+        span.appendChild(piece);
+      }
+    }
+  } catch (e) {
+    /* never break reading-view rendering */
+  }
+}
+// Live preview / source: replace-decorate the hidden ranges so the raw text
+// simply is not rendered. Lines the selection touches are left alone — the
+// full line shows while the cursor is on it (obsidian-tasks' reveal-on-edit
+// behaviour), which also keeps the [] shortcut (cursor lands right after the
+// stamped ➕ date) fully visible while typing. Guarded by the module-level
+// CM6_VIEW probe: no @codemirror/view → [] (a valid empty extension).
+function bnTaskDateEditorExtension(plugin) {
+  if (!CM6_VIEW || !CM6_VIEW.ViewPlugin || !CM6_VIEW.Decoration) return [];
+  const ViewPlugin = CM6_VIEW.ViewPlugin;
+  const Decoration = CM6_VIEW.Decoration;
+  const build = (view) => {
+    try {
+      const out = [];
+      if (
+        !plugin.alive ||
+        !plugin.settings ||
+        !plugin.settings.enableTasks ||
+        plugin.settings.showTaskDates
+      ) {
+        return Decoration.set(out, true);
+      }
+      const state = view.state;
+      if (!state || !state.doc || !state.selection) return Decoration.set(out, true);
+      const sel = state.selection.ranges || [];
+      for (const block of view.viewport || []) {
+        for (let pos = block.from; pos <= block.to; ) {
+          const line = state.doc.lineAt(pos);
+          const next = line.to + 1;
+          if (next <= pos) break; // never stall on a degenerate viewport edge
+          pos = next;
+          let touched = false;
+          for (let i = 0; i < sel.length; i++) {
+            if (sel[i].from <= line.to + 1 && sel[i].to >= line.from) {
+              touched = true;
+              break;
+            }
+          }
+          if (touched) continue;
+          for (const rg of taskDateHideRanges(line.text)) {
+            out.push(Decoration.replace(line.from + rg.from, line.from + rg.to));
+          }
+        }
+      }
+      return Decoration.set(out, true);
+    } catch (e) {
+      try {
+        return Decoration.set([], true);
+      } catch (e2) {
+        /* unreachable — keep the view alive no matter what */
+      }
+    }
+  };
+  const Holder = function (view) {
+    this.decorations = build(view);
+  };
+  return ViewPlugin.fromClass(Holder, {
+    decorations: (v) => v.decorations,
+    update: (v, vu) => {
+      v.decorations = build(vu.view);
+    },
+    destroy: () => {},
+  });
+}
 // Collect one document's tasks; lines inside fenced code blocks are skipped.
 function scanTasks(content) {
   const out = [];
@@ -2518,9 +2910,12 @@ function renderTaskCard(plugin, parent, item, opts) {
   };
   if (t.priority) chip(t.priority, "", "bn-task-chip-prio");
   if (t.dueDate) chip("📅", t.dueDate, daysUntil(t.dueDate) < 0 ? "bn-task-chip-overdue" : "");
-  if (t.createdDate) chip("➕", t.createdDate);
-  if (t.doneDate) chip("✅", t.doneDate, "bn-task-chip-done");
-  if (t.cancelledDate) chip("❌", t.cancelledDate, "bn-task-chip-done");
+  // v1.1.0: the bookkeeping stamps follow the "Show task date fields" toggle
+  // (due + priority above always show — they carry meaning, not timestamps)
+  const showDates = plugin.settings.showTaskDates === true;
+  if (showDates && t.createdDate) chip("➕", t.createdDate);
+  if (showDates && t.doneDate) chip("✅", t.doneDate, "bn-task-chip-done");
+  if (showDates && t.cancelledDate) chip("❌", t.cancelledDate, "bn-task-chip-done");
   const src = meta.createSpan({
     cls: "bn-task-chip bn-task-chip-src",
     attr: { title: item.file.path },
@@ -2872,6 +3267,57 @@ var TaskEditModal = class extends obsidian.Modal {
   }
 };
 
+// ---- v1.2.0: breadcrumb hover → child notes menu --------------------------------
+// Obsidian (≥1.7) renders the note's parent path in the view header as
+// span.view-header-breadcrumb segments ("工作 / 项目 / …"), each followed by a
+// "/" separator span; a native CLICK only reveals the folder in the SYSTEM
+// file manager (showItemInFolder — verified against obsidian.asar 1.14.5).
+// This adds Notion-style navigation: hovering a segment pops that folder's
+// child notes (plugin order + hide rules honoured, home notes excluded) and
+// a click opens the child — folders via openFolder (their home note), files
+// directly. The path needs NO view lookup: the segment texts of one header,
+// joined up to the hovered index, ARE the folder path (they were built from
+// the parent path's components).
+// The hovered segment → folder path (or null when the DOM is unexpected).
+function bnCrumbPathOf(seg) {
+  try {
+    const parent = seg.parentElement;
+    if (!parent || typeof parent.children === "undefined") return null;
+    const segs = [];
+    for (const c of parent.children) {
+      if (c.nodeType === 1 && c.classList && c.classList.contains("view-header-breadcrumb")) {
+        segs.push(c);
+      }
+    }
+    const idx = segs.indexOf(seg);
+    if (idx === -1) return null;
+    const names = [];
+    for (let i = 0; i <= idx; i++) names.push(String(segs[i].textContent || "").trim());
+    if (!names.length) return null;
+    for (const n of names) if (!n || n.indexOf("/") !== -1) return null;
+    return names.join("/");
+  } catch (e) {
+    return null;
+  }
+}
+// Fill the menu: header count + one bn-child-row per child (renderChildRow
+// carries icon + click-to-open, ctrl/cmd = new tab). Empty folders get a
+// hint row instead. Returns the child count.
+function bnRenderCrumbMenu(plugin, menu, folderPath) {
+  const zh = plugin.isZh();
+  const kids = plugin.orderedChildrenOf(folderPath);
+  menu.createDiv({
+    cls: "bn-children-header",
+    text: (zh ? "子页面" : "Child notes") + " · " + kids.length,
+  });
+  if (!kids.length) {
+    menu.createDiv({ cls: "bn-crumb-empty", text: zh ? "暂无子文档" : "No child notes" });
+    return 0;
+  }
+  for (const child of kids) plugin.renderChildRow(menu, child, { time: false }, 0);
+  return kids.length;
+}
+
 // ---------------------------------------------------------------------------
 // §7 the host plugin
 // ---------------------------------------------------------------------------
@@ -2881,6 +3327,7 @@ const HOST_DEFAULTS = {
   showCounts: true,
   showAliases: false,
   linkCreatesChild: true,
+  breadcrumbChildren: true,
   dblClickExpand: true,
   enableHideItem: true,
   enableFavorites: true,
@@ -2888,6 +3335,7 @@ const HOST_DEFAULTS = {
   enableTasks: true,
   autoIcon: true,
   taskViewTab: "bench",
+  showTaskDates: false,
   enableViewMode: true,
   viewModeKey: "auto-view-mode",
   enableEmptyHomeDelete: true,
@@ -3043,7 +3491,12 @@ const BeautifyPlugin = class extends obsidian.Plugin {
         if (m === "name" || m === "mtime" || m === "ctime") modes[k] = m;
       }
     }
-    // icons: import emoji icons from Iconic once, then trust our own copy
+    // icons: import emoji icons from Iconic once, then trust our own copy.
+    // v1.3.0: icons serialize inside the orderEditor TREE now — a host slot
+    // without `icons` is the steady state, and the in-memory map (filled by
+    // the store's tree parse) must SURVIVE this rebind; a flat `icons` map is
+    // the legacy pre-v1.3.0 shape and still loads (it migrates into the tree
+    // on the first v3 save).
     let icons = {};
     if (slot.icons && typeof slot.icons === "object") {
       for (const k of Object.keys(slot.icons)) {
@@ -3051,6 +3504,8 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       }
     } else if (slot.iconsImported !== true) {
       icons = await this.importIconicIcons();
+    } else {
+      icons = Object.assign({}, this.settings.icons || {});
     }
     // hide rules: import from Hide Folders once
     let hideRules = Array.isArray(slot.hideRules)
@@ -3074,6 +3529,7 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       showCounts: typeof slot.showCounts === "boolean" ? slot.showCounts : HOST_DEFAULTS.showCounts,
       showAliases: boolSlot(slot, "showAliases"),
       linkCreatesChild: boolSlot(slot, "linkCreatesChild"),
+      breadcrumbChildren: boolSlot(slot, "breadcrumbChildren"),
       dblClickExpand:
         typeof slot.dblClickExpand === "boolean"
           ? slot.dblClickExpand
@@ -3100,6 +3556,7 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       taskViewTab: ["bench", "kanban", "matrix"].includes(slot.taskViewTab)
         ? slot.taskViewTab
         : "bench",
+      showTaskDates: boolSlot(slot, "showTaskDates"),
       taskMeta: sanitizeTaskMeta(slot.taskMeta),
       autoIcon: boolSlot(slot, "autoIcon"),
       enableViewMode: boolSlot(slot, "enableViewMode"),
@@ -3119,6 +3576,8 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       showHidden,
     };
     this.__lastShowHidden = showHidden;
+    // v1.3.0: baseline for saveSettings' icons-changed detection
+    this.__iconsJson = JSON.stringify(this.settings.icons || {});
   }
   async importIconicIcons() {
     const icons = {};
@@ -3165,7 +3624,29 @@ const BeautifyPlugin = class extends obsidian.Plugin {
   async saveSettings() {
     const showHiddenChanged =
       this.__lastShowHidden !== undefined && this.__lastShowHidden !== this.settings.showHidden;
-    await this.writeSlot("host", this.settings);
+    // v1.3.0: icons serialize inside the orderEditor tree — strip them from
+    // the host payload when the order store is alive (it owns the tree), and
+    // reserialize the tree when they changed through this path (picker,
+    // auto-icon, rename rekey). With the store down (order core failed to
+    // start) the legacy flat host icons stay the fallback so nothing is lost.
+    const storeAlive = !!(
+      this.order &&
+      this.order.store &&
+      this.order.store.isUsable &&
+      this.order.store.isUsable()
+    );
+    const payload =
+      storeAlive && this.settings.icons
+        ? Object.assign({}, this.settings, { icons: undefined })
+        : this.settings;
+    await this.writeSlot("host", payload);
+    if (storeAlive) {
+      const json = JSON.stringify(this.settings.icons || {});
+      if (json !== this.__iconsJson) {
+        this.__iconsJson = json;
+        this.order.store.touchIcons();
+      }
+    }
     this.refreshCounts();
     if (showHiddenChanged) {
       this.refresh();
@@ -3351,6 +3832,21 @@ const BeautifyPlugin = class extends obsidian.Plugin {
           ? "在首页笔记里点击未解析的内部链接(如 [[新页面]])时,新笔记自动创建在该目录下,而不是默认的新笔记位置。"
           : "Clicking an unresolved internal link inside a home note creates the new note inside that folder instead of the default location.",
         control: { type: "toggle", key: "linkCreatesChild" },
+      },
+      {
+        name: zh ? "面包屑悬停显示子文档" : "Breadcrumb hover shows child notes",
+        desc: zh
+          ? "鼠标悬停文档顶部面包屑的任意目录段,弹出该目录的子文档列表(遵循文件列表的排序与隐藏规则,目录的首页笔记不重复列出),点击即打开——目录打开其首页笔记,文档直接打开,Ctrl/⌘ 点击在新标签页打开。点击面包屑本身保持原生行为(在系统文件管理器中显示该目录)。"
+          : "Hover any folder segment of the breadcrumb at the top of a note to pop up that folder's child notes (same order and hide rules as the file explorer; a folder's home note is not repeated) — click to open it: folders via their home note, files directly, Ctrl/Cmd-click for a new tab. Clicking the breadcrumb itself keeps the native behaviour (reveal the folder in the system file manager).",
+        render: function (setting) {
+          setting.addToggle(function (tg) {
+            return tg.setValue(_this.settings.breadcrumbChildren !== false).onChange(function (v) {
+              _this.settings.breadcrumbChildren = v;
+              _this.__crumbMenuRemove();
+              void _this.saveSettings();
+            });
+          });
+        },
       },
       {
         name: zh ? "显示别名" : "Show aliases",
@@ -3564,6 +4060,24 @@ const BeautifyPlugin = class extends obsidian.Plugin {
                 .catch(function (e) {
                   console.error("[beautify] failed to toggle tasks:", e);
                 });
+            });
+          });
+        },
+      },
+      {
+        name: zh ? "任务行显示日期字段" : "Show task date fields",
+        desc: zh
+          ? "默认关闭:笔记中的任务行隐藏行内日期字段(➕ 创建 ✅ 完成 ❌ 取消 🛫 开始 ⏳ 计划),仅显示正文、📅 截止与优先级;字段仍完整保存在任务行内,实时预览/源码中光标所在行自动显示完整内容,编辑弹窗不受影响。打开后各处按原样显示。任务视图卡片上的 ➕/✅/❌ 时间戳标签同样跟随本开关。"
+          : "Off by default: task lines in notes hide their inline date fields (➕ created ✅ done ❌ cancelled 🛫 start ⏳ scheduled), showing only the text, 📅 due and the priority; the fields stay fully saved in the line, the line under the cursor shows its full content in live preview/source, and the edit modal is unaffected. Turn on to display every field as written. The ➕/✅/❌ chips on dashboard cards follow the same toggle.",
+        render: function (setting) {
+          setting.addToggle(function (tg) {
+            return tg.setValue(_this.settings.showTaskDates === true).onChange(function (v) {
+              _this.settings.showTaskDates = v;
+              document.body.classList.toggle("bn-show-task-dates", v);
+              _this.__kickTaskDateDecorations();
+              void _this.saveSettings().then(function () {
+                _this.refreshTaskViews();
+              });
             });
           });
         },
@@ -4848,6 +5362,27 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       }
     }
   }
+  // v1.1.0: the date-fields toggle changed — every open editor rebuilds its
+  // task-date decorations. A selection-only transaction (same anchor/head,
+  // no scroll) makes the view update non-empty so ViewPlugin.update reruns;
+  // reading view needs nothing (CSS body class already flipped by the caller).
+  __kickTaskDateDecorations() {
+    try {
+      this.app.workspace.iterateAllLeaves((leaf) => {
+        try {
+          const cm = leaf.view && leaf.view.editor && leaf.view.editor.cm;
+          if (cm && cm.state && cm.state.selection && typeof cm.dispatch === "function") {
+            const sel = cm.state.selection.main;
+            cm.dispatch(cm.state.update({ selection: { anchor: sel.anchor, head: sel.head } }));
+          }
+        } catch (e) {
+          /* per-leaf best effort */
+        }
+      });
+    } catch (e) {
+      /* a settings toggle must never throw here */
+    }
+  }
   // Open (creating on first use) the task view note.
   async openTasksNote() {
     try {
@@ -5256,6 +5791,9 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     const host = this;
     for (const li of items) {
       (function (li) {
+        // v1.1.0: hide the trailing date fields first (own guard — runs even
+        // when the wiring below already ran on a re-processed section)
+        bnWrapReadingTaskDates(li);
         if (li.__bnTaskWired) return;
         const checkbox = li.querySelector("input.task-list-item-checkbox");
         if (!checkbox) return;
@@ -6139,6 +6677,11 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       ) {
         try {
           await this.order.load(); // steady-shape reload only (guarded above)
+          // complete a v2→v3 conversion that arrived from outside, same as
+          // onload does: rebind the host slot so its legacy flat icons leave
+          if (this.order.store && this.order.store.migratedToTree) {
+            void this.saveSettings();
+          }
         } catch (e) {
           console.error("[beautify] failed to reload order data after external change:", e);
         }
@@ -6470,6 +7013,109 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     }
     if (this.__traceMark) this.__traceMark("host.childrenBlocks(列表块)", Date.now() - __t);
   }
+  // ---- v1.2.0: breadcrumb hover → child notes menu -------------------------------
+  // One delegated mouseover drives everything: hover a segment → show its
+  // folder's menu; hover INTO the menu → keep it; hover anywhere else → hide
+  // after a grace period. Click/Esc/scroll hide it immediately.
+  __onCrumbMouseOver(ev) {
+    try {
+      if (this.__crumbHideTimer) {
+        clearTimeout(this.__crumbHideTimer);
+        this.__crumbHideTimer = null;
+      }
+      if (!this.alive || this.settings.breadcrumbChildren === false) {
+        // never strand an open menu behind a cleared hide timer
+        if (this.__crumbMenu) this.__crumbMenuRemove();
+        return;
+      }
+      const target = ev.target;
+      if (!target || typeof target.closest !== "function") return;
+      if (this.__crumbMenu && this.__crumbMenu.contains(target)) return; // inside — keep open
+      const seg = target.closest(".view-header-breadcrumb");
+      if (!seg || !seg.parentElement) {
+        this.__crumbMenuScheduleHide();
+        return;
+      }
+      const path = bnCrumbPathOf(seg);
+      const folder =
+        path && this.app && this.app.vault
+          ? this.app.vault.getAbstractFileByPath(path)
+          : null;
+      if (!(folder instanceof obsidian.TFolder)) {
+        // external-file breadcrumbs or a vanished folder — not ours to list
+        this.__crumbMenuScheduleHide();
+        return;
+      }
+      if (
+        this.__crumbMenu &&
+        this.__crumbMenu.__bnPath === path &&
+        this.__crumbMenu.isConnected !== false
+      ) {
+        return; // already showing this folder
+      }
+      this.__crumbMenuShow(seg, path);
+    } catch (e) {
+      /* hover is best-effort */
+    }
+  }
+  __crumbMenuShow(seg, path) {
+    this.__crumbMenuRemove();
+    const menu = document.body.createEl("div", { cls: "bn-crumb-menu" });
+    menu.__bnPath = path;
+    try {
+      bnRenderCrumbMenu(this, menu, path);
+    } catch (e) {
+      // a render failure must not leave an empty box pinned to the screen
+      try {
+        menu.remove();
+      } catch (e2) {
+        /* already gone */
+      }
+      console.error("[beautify] failed to render the breadcrumb menu:", e);
+      return;
+    }
+    // any click inside (a row) opens the note — hide once the click landed
+    menu.addEventListener("click", () => this.__crumbMenuRemove());
+    // position after append (size is knowable), clamped into the viewport;
+    // flip above the header when the menu would run past the bottom
+    try {
+      const r = seg.getBoundingClientRect();
+      const w = menu.offsetWidth || 200;
+      const h = menu.offsetHeight || 120;
+      const vw = window.innerWidth || 1200;
+      const vh = window.innerHeight || 800;
+      let left = Math.min(Math.max(8, r.left), Math.max(8, vw - w - 8));
+      let top = r.bottom + 6;
+      if (top + h > vh - 8) top = Math.max(8, r.top - h - 6);
+      menu.style.left = left + "px";
+      menu.style.top = top + "px";
+    } catch (e) {
+      /* position is decorative; visibility beats precision */
+    }
+    this.__crumbMenu = menu;
+  }
+  __crumbMenuScheduleHide() {
+    if (this.__crumbHideTimer || !this.__crumbMenu) return;
+    this.__crumbHideTimer = setTimeout(() => {
+      this.__crumbHideTimer = null;
+      this.__crumbMenuRemove();
+    }, 200);
+  }
+  __crumbMenuRemove() {
+    if (this.__crumbHideTimer) {
+      clearTimeout(this.__crumbHideTimer);
+      this.__crumbHideTimer = null;
+    }
+    if (this.__crumbMenu) {
+      try {
+        if (typeof this.__crumbMenu.remove === "function") this.__crumbMenu.remove();
+        else if (this.__crumbMenu.parentNode) this.__crumbMenu.parentNode.removeChild(this.__crumbMenu);
+      } catch (e) {
+        /* already gone */
+      }
+      this.__crumbMenu = null;
+    }
+  }
 
   // ---- feature: child note template ---------------------------------------------
   templateApplier() {
@@ -6708,6 +7354,12 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       );
       this.order = null;
     }
+    // v1.3.0: a v2 (flat) orderEditor slot was rewritten as the document tree
+    // by store.load — rebind the host slot too so the legacy flat icons map
+    // leaves the note and the conversion completes in one launch.
+    if (this.order && this.order.store && this.order.store.migratedToTree) {
+      void this.saveSettings();
+    }
 
     // 2) Branch Note layer second: wraps explorer view instances on top.
     this.startBranchNote();
@@ -6757,6 +7409,10 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     });
     // task management: reading-mode hover buttons + index upkeep
     this.registerMarkdownPostProcessor((el, ctx) => this.decorateReadingTasks(el, ctx));
+    // v1.1.0: hide the inline date fields in live preview / source mode too
+    // (reveal-on-cursor-line); the body class gates the reading-view spans
+    this.registerEditorExtension(bnTaskDateEditorExtension(this));
+    document.body.classList.toggle("bn-show-task-dates", !!this.settings.showTaskDates);
     // [] + space expansion and the floating hover button (plain Obsidian APIs)
     this.registerEvent(
       this.app.workspace.on("editor-change", (editor, info) =>
@@ -6764,6 +7420,50 @@ const BeautifyPlugin = class extends obsidian.Plugin {
       )
     );
     this.registerDomEvent(document, "mouseover", (ev) => this.__onTaskEditorMouseOver(ev));
+    // v1.2.0: breadcrumb hover → child notes menu (hide on click-away/Esc/
+    // scroll; the same capture-scroll convention as the task hover bar)
+    this.registerDomEvent(document, "mouseover", (ev) => this.__onCrumbMouseOver(ev));
+    this.registerDomEvent(
+      document,
+      "click",
+      (ev) => {
+        if (
+          this.__crumbMenu &&
+          ev.target &&
+          !(this.__crumbMenu.contains && this.__crumbMenu.contains(ev.target))
+        ) {
+          this.__crumbMenuRemove();
+        }
+      },
+      true
+    );
+    this.registerDomEvent(
+      document,
+      "keydown",
+      (ev) => {
+        if (ev.key === "Escape") this.__crumbMenuRemove();
+      },
+      true
+    );
+    this.registerDomEvent(
+      document,
+      "scroll",
+      (ev) => {
+        // capture sees scrolls INSIDE the menu too (the list can scroll) —
+        // those must not close it; everything else repositions the world
+        if (
+          this.__crumbMenu &&
+          ev &&
+          ev.target &&
+          this.__crumbMenu.contains &&
+          this.__crumbMenu.contains(ev.target)
+        ) {
+          return;
+        }
+        this.__crumbMenuRemove();
+      },
+      true
+    );
     // empty home note: Backspace/Delete removes it (capture beats CM6's own handlers)
     this.registerDomEvent(document, "keydown", (ev) => this.__onEmptyHomeDeleteKey(ev), true);
     this.registerDomEvent(document, "scroll", () => this.__hideTaskFloat(), true);
@@ -6958,6 +7658,11 @@ const BeautifyPlugin = class extends obsidian.Plugin {
     }
     this.__trace = null;
     this.__removeTaskFloat();
+    // v1.2.0: the breadcrumb hover menu lives in document.body — remove it
+    this.__crumbMenuRemove();
+    // v1.1.0: drop the reading-view date-fields visibility class (any spans
+    // already rendered become inert without the plugin's CSS once disabled)
+    document.body.classList.remove("bn-show-task-dates");
     this.__taskIndex.clear();
     if (this.__taskRefreshTimer) {
       clearTimeout(this.__taskRefreshTimer);

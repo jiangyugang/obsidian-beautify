@@ -851,3 +851,43 @@ input.task-list-item-checkbox {
 .bn-task-modal-dates .setting-item-control { margin: 0; flex: 1 1 auto; }
 .bn-task-modal-dates .setting-item-info { flex: 0 0 auto; }
 .bn-task-date-input { width: 100%; }
+
+/* v1.1.0: task inline date fields (➕ created ✅ done ❌ cancelled 🛫 start
+   ⏳ scheduled) are hidden in notes by default — reading view wraps them in
+   .bn-task-dates; live preview/source hides them via CodeMirror decorations.
+   📅 due and the priority stay visible. The settings toggle (任务行显示日期
+   字段 / "Show task date fields") sets body.bn-show-task-dates to reveal. */
+.bn-task-dates { display: none; }
+body.bn-show-task-dates .bn-task-dates { display: inline; }
+
+/* v1.2.0: breadcrumb hover → child notes menu (fixed in body, positioned
+   under the hovered .view-header-breadcrumb segment; rows reuse .bn-child-row
+   and .bn-children-header so the menu reads like the bn-children block) */
+.bn-crumb-menu {
+	position: fixed;
+	z-index: 35;
+	min-width: 180px;
+	max-width: 320px;
+	max-height: 50vh;
+	/* v1.3.1: NO horizontal scrollbar — with only overflow-y set, CSS
+	   computes the visible axis to auto and a long child name would grow a
+	   horizontal bar; hidden + the label ellipsis below truncates instead */
+	overflow-y: auto;
+	overflow-x: hidden;
+	padding: 6px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background: var(--background-primary);
+	box-shadow: var(--shadow-s);
+	/* v1.2.1: match the breadcrumb's own typography — the header renders
+	   through .view-header-title-container (file-header font vars), the menu
+	   hangs off body and would otherwise fall back to the interface font */
+	font-family: var(--file-header-font, var(--font-interface));
+	font-size: var(--file-header-font-size, var(--font-ui-small));
+}
+.bn-crumb-menu .bn-children-header { padding: 2px 8px 6px; margin: 0; }
+.bn-crumb-empty { padding: 8px 10px; color: var(--text-faint); font-size: var(--font-ui-smaller); }
+/* long names ellipsize inside the 320px cap rather than pushing a scrollbar;
+   min-width: 0 is what lets a flex child shrink below its content size */
+.bn-crumb-menu .bn-child-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bn-crumb-menu .bn-child-icon { flex-shrink: 0; }
